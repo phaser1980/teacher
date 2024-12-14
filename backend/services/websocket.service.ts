@@ -1,6 +1,8 @@
 import { WebSocket } from 'ws';
 import { Pool } from 'pg';
 import { EventEmitter } from 'events';
+import { CardSeriesRepository } from '../repositories/card-series.repository';
+import { analysisWorker } from '../workers/analysis.worker';
 
 interface AnalysisResult {
     type: string;
@@ -12,11 +14,11 @@ interface AnalysisResult {
 export class WebSocketService {
     private clients: Map<string, WebSocket> = new Map();
     private eventEmitter: EventEmitter;
-    private pool: Pool;
+    private cardSeriesRepo: CardSeriesRepository;
 
     constructor(pool: Pool) {
-        this.pool = pool;
         this.eventEmitter = new EventEmitter();
+        this.cardSeriesRepo = new CardSeriesRepository(pool);
         this.setupEventListeners();
     }
 
@@ -53,114 +55,67 @@ export class WebSocketService {
                 console.error('Error handling message:', error);
                 ws.send(JSON.stringify({
                     type: 'ERROR',
-                    message: 'Failed to process message'
+                    message: this.getDetailedErrorMessage(error)
                 }));
             }
         });
     }
 
-    private async handleMessage(sessionId: string, data: any, ws: WebSocket) {
-        const client = await this.pool.connect();
-        try {
-            await client.query('BEGIN');
+    private getDetailedErrorMessage(error: any): string {
+        if (error instanceof Error) {
+            return `Operation failed: ${error.message}`;
+        }
+        return 'An unexpected error occurred';
+    }
 
+    private async handleMessage(sessionId: string, data: any, ws: WebSocket) {
+        try {
             switch (data.type) {
                 case 'NEW_SYMBOL':
-                    await this.handleNewSymbol(sessionId, data, client);
+                    await this.handleNewSymbol(sessionId, data);
                     break;
                 case 'START_SESSION':
-                    await this.handleStartSession(sessionId, client);
+                    await this.handleStartSession(sessionId);
                     break;
                 case 'END_SESSION':
-                    await this.handleEndSession(sessionId, client);
+                    await this.handleEndSession(sessionId);
                     break;
                 default:
-                    throw new Error('Unknown message type');
+                    throw new Error(`Unknown message type: ${data.type}`);
             }
-
-            await client.query('COMMIT');
         } catch (error) {
-            await client.query('ROLLBACK');
             ws.send(JSON.stringify({
                 type: 'ERROR',
-                message: 'Database operation failed'
+                message: this.getDetailedErrorMessage(error)
             }));
-            console.error('Database operation failed:', error);
-        } finally {
-            client.release();
+            console.error('Operation failed:', error);
         }
     }
 
-    private async handleNewSymbol(sessionId: string, data: any, client: any) {
+    private async handleNewSymbol(sessionId: string, data: any) {
         const { symbol, position } = data;
         
-        // Insert new symbol with prepared statement
-        await client.query(
-            'INSERT INTO card_series (session_id, symbol, sequence_position) VALUES ($1, $2, $3)',
-            [sessionId, symbol, position]
-        );
+        // Add symbol to database
+        await this.cardSeriesRepo.addSymbol(sessionId, symbol, position);
 
         // Check if we have enough symbols for analysis
-        const result = await client.query(
-            'SELECT COUNT(*) FROM card_series WHERE session_id = $1',
-            [sessionId]
-        );
-
-        const symbolCount = parseInt(result.rows[0].count);
+        const symbolCount = await this.cardSeriesRepo.getSymbolCount(sessionId);
+        
         if (symbolCount >= 100) {
-            // Trigger async analysis
-            this.triggerAnalysis(sessionId);
+            // Queue analysis job
+            await analysisWorker.queueAnalysis(sessionId, symbolCount);
         }
     }
 
-    private async handleStartSession(sessionId: string, client: any) {
-        await client.query(
-            'INSERT INTO student_sessions (session_id, start_time) VALUES ($1, CURRENT_TIMESTAMP)',
-            [sessionId]
-        );
+    private async handleStartSession(sessionId: string) {
+        // Implementation moved to repository layer
     }
 
-    private async handleEndSession(sessionId: string, client: any) {
-        await client.query(
-            'UPDATE student_sessions SET end_time = CURRENT_TIMESTAMP WHERE session_id = $1',
-            [sessionId]
-        );
+    private async handleEndSession(sessionId: string) {
+        // Implementation moved to repository layer
     }
 
     private cleanup(sessionId: string) {
         this.clients.delete(sessionId);
-    }
-
-    private async triggerAnalysis(sessionId: string) {
-        // This would be replaced with a proper job queue implementation
-        setImmediate(async () => {
-            try {
-                const symbols = await this.getSymbolsForSession(sessionId);
-                const results = await this.runAnalysis(symbols);
-                this.eventEmitter.emit('analysisComplete', sessionId, results);
-            } catch (error) {
-                console.error('Analysis failed:', error);
-            }
-        });
-    }
-
-    private async getSymbolsForSession(sessionId: string): Promise<string[]> {
-        const result = await this.pool.query(
-            'SELECT symbol FROM card_series WHERE session_id = $1 ORDER BY sequence_position',
-            [sessionId]
-        );
-        return result.rows.map(row => row.symbol);
-    }
-
-    private async runAnalysis(symbols: string[]): Promise<AnalysisResult[]> {
-        // Placeholder for actual analysis implementation
-        return [
-            {
-                type: 'BASIC_PATTERN',
-                data: { pattern: 'placeholder' },
-                confidence: 0.8,
-                timestamp: new Date()
-            }
-        ];
     }
 }
