@@ -1,7 +1,7 @@
 import { WebSocket, Server } from 'ws';
 import { Pool } from 'pg';
-import { EventEmitter } from 'events';
 import Bull from 'bull';
+import { throttle } from 'lodash';
 import { SymbolRepository } from '../repositories/symbol.repository';
 import { SessionRepository } from '../repositories/session.repository';
 import { AnalysisRepository } from '../repositories/analysis.repository';
@@ -13,22 +13,14 @@ interface AnalysisResult {
     possibleRngSeed?: string;
 }
 
-interface AnalysisUpdate {
-    modelName: string;
-    progress: number;
-    phase: string;
-    intermediateResults?: any;
-}
-
-interface RNGProgress {
-    progress: number;
-    detectedPatterns: number;
-    confidenceTrend: number;
-    currentPhase: string;
+interface SessionThresholds {
+    basic: number;
+    intermediate: number;
+    advanced: number;
 }
 
 interface WebSocketMessage {
-    type: 'SUBMIT_SYMBOL' | 'REQUEST_ANALYSIS' | 'START_SESSION';
+    type: 'SUBMIT_SYMBOL' | 'REQUEST_ANALYSIS' | 'START_SESSION' | 'RESUME_SESSION';
     payload: any;
 }
 
@@ -38,20 +30,33 @@ export class WebSocketService {
     private symbolRepo: SymbolRepository;
     private sessionRepo: SessionRepository;
     private analysisRepo: AnalysisRepository;
-    private readonly ANALYSIS_THRESHOLD = 5;
+    private readonly DEFAULT_THRESHOLDS: SessionThresholds = {
+        basic: 5,
+        intermediate: 20,
+        advanced: 50
+    };
 
     constructor(pool: Pool) {
         this.symbolRepo = new SymbolRepository(pool);
         this.sessionRepo = new SessionRepository(pool);
         this.analysisRepo = new AnalysisRepository(pool);
         this.analysisQueue = new Bull('analysis', {
-            redis: process.env.REDIS_URL || 'redis://localhost:6379'
+            redis: process.env.REDIS_URL || 'redis://localhost:6379',
+            defaultJobOptions: {
+                attempts: 3,
+                backoff: {
+                    type: 'exponential',
+                    delay: 1000
+                },
+                removeOnComplete: false,
+                removeOnFail: false
+            }
         });
         this.setupQueueHandlers();
     }
 
     public initialize(wss: Server) {
-        wss.on('connection', (ws: WebSocket) => {
+        wss.on('connection', async (ws: WebSocket) => {
             const sessionId = this.generateSessionId();
             this.clients.set(sessionId, ws);
 
@@ -60,8 +65,7 @@ export class WebSocketService {
                     const data: WebSocketMessage = JSON.parse(message);
                     await this.handleMessage(sessionId, data);
                 } catch (error) {
-                    console.error('Error handling message:', error);
-                    this.sendError(ws, 'Invalid message format');
+                    await this.handleError(ws, error);
                 }
             });
 
@@ -76,7 +80,8 @@ export class WebSocketService {
             // Send session ID to client
             ws.send(JSON.stringify({
                 type: 'SESSION_CREATED',
-                sessionId
+                sessionId,
+                thresholds: this.DEFAULT_THRESHOLDS
             }));
         });
     }
@@ -95,6 +100,9 @@ export class WebSocketService {
             case 'START_SESSION':
                 await this.startNewSession(sessionId);
                 break;
+            case 'RESUME_SESSION':
+                await this.resumeSession(sessionId, message.payload.previousSessionId);
+                break;
         }
     }
 
@@ -106,31 +114,31 @@ export class WebSocketService {
             // Store symbol
             await this.symbolRepo.addSymbol(sessionId, symbol);
             
-            // Get symbol count for session
+            // Get symbol count and thresholds
             const count = await this.symbolRepo.getSymbolCount(sessionId);
+            const thresholds = await this.sessionRepo.getThresholds(sessionId) || this.DEFAULT_THRESHOLDS;
             
             // Send progress update
             ws.send(JSON.stringify({
                 type: 'PROGRESS_UPDATE',
                 count,
-                threshold: this.ANALYSIS_THRESHOLD,
+                thresholds,
                 milestones: {
-                    basic: count >= 5,
-                    intermediate: count >= 20,
-                    advanced: count >= 50
+                    basic: count >= thresholds.basic,
+                    intermediate: count >= thresholds.intermediate,
+                    advanced: count >= thresholds.advanced
                 }
             }));
 
-            // Trigger analysis if threshold reached
-            if (count >= this.ANALYSIS_THRESHOLD) {
+            // Trigger analysis if any threshold is reached
+            if (count >= thresholds.basic) {
                 await this.triggerAnalysis(sessionId);
             }
 
             // Send session status update
             await this.sendSessionStatus(sessionId);
         } catch (error) {
-            console.error('Error handling symbol submission:', error);
-            this.sendError(ws, 'Failed to process symbol');
+            await this.handleError(ws, error);
         }
     }
 
@@ -138,30 +146,31 @@ export class WebSocketService {
         const ws = this.clients.get(sessionId);
         if (!ws) return;
 
-        const status = await this.sessionRepo.getSessionStatus(sessionId);
-        const analysisHistory = await this.analysisRepo.getSessionHistory(sessionId);
+        try {
+            const status = await this.sessionRepo.getSessionStatus(sessionId);
+            const analysisHistory = await this.analysisRepo.getSessionHistory(sessionId);
+            const thresholds = await this.sessionRepo.getThresholds(sessionId) || this.DEFAULT_THRESHOLDS;
 
-        ws.send(JSON.stringify({
-            type: 'SESSION_STATUS',
-            status,
-            history: analysisHistory,
-            metrics: {
-                totalSymbols: status.symbolCount,
-                analysisRuns: analysisHistory.length,
-                averageConfidence: this.calculateAverageConfidence(analysisHistory)
-            }
-        }));
-    }
-
-    private calculateAverageConfidence(history: any[]): number {
-        if (!history.length) return 0;
-        return history.reduce((acc, curr) => acc + curr.confidence, 0) / history.length;
+            ws.send(JSON.stringify({
+                type: 'SESSION_STATUS',
+                status,
+                history: analysisHistory,
+                thresholds,
+                metrics: {
+                    totalSymbols: status.symbolCount,
+                    analysisRuns: analysisHistory.length,
+                    averageConfidence: this.calculateAverageConfidence(analysisHistory)
+                }
+            }));
+        } catch (error) {
+            await this.handleError(ws, error);
+        }
     }
 
     private async triggerAnalysis(sessionId: string) {
         const symbols = await this.symbolRepo.getSymbols(sessionId);
         
-        // Add analysis job to queue
+        // Add analysis job to queue with retries
         await this.analysisQueue.add({
             sessionId,
             symbols
@@ -169,15 +178,13 @@ export class WebSocketService {
     }
 
     private setupQueueHandlers() {
+        // Handle completed jobs
         this.analysisQueue.on('completed', async (job, result) => {
             const { sessionId } = job.data;
             const ws = this.clients.get(sessionId);
             
             if (ws && ws.readyState === WebSocket.OPEN) {
-                // Store analysis results
                 await this.analysisRepo.saveResults(sessionId, result);
-                
-                // Send results to client
                 ws.send(JSON.stringify({
                     type: 'ANALYSIS_RESULTS',
                     results: result
@@ -185,42 +192,60 @@ export class WebSocketService {
             }
         });
 
-        this.analysisQueue.on('progress', async (job, progress) => {
+        // Handle failed jobs
+        this.analysisQueue.on('failed', async (job, error) => {
             const { sessionId } = job.data;
             const ws = this.clients.get(sessionId);
-
+            
             if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                    type: 'ANALYSIS_UPDATE',
-                    update: progress
-                }));
+                await this.handleError(ws, error);
             }
         });
+
+        // Throttled RNG progress updates
+        const sendRNGProgress = throttle(async (sessionId: string, ws: WebSocket) => {
+            const progress = await this.analysisRepo.getRNGProgress(sessionId);
+            if (progress && progress.progress > 0) {
+                ws.send(JSON.stringify({
+                    type: 'RNG_PROGRESS',
+                    progress
+                }));
+            }
+        }, 5000);
 
         // Monitor RNG discovery progress
         setInterval(async () => {
             for (const [sessionId, ws] of this.clients.entries()) {
                 if (ws.readyState === WebSocket.OPEN) {
-                    const rngProgress = await this.analysisRepo.getRNGProgress(sessionId);
-                    if (rngProgress) {
-                        ws.send(JSON.stringify({
-                            type: 'RNG_PROGRESS',
-                            progress: rngProgress
-                        }));
-                    }
+                    await sendRNGProgress(sessionId, ws);
                 }
             }
-        }, 2000); // Update every 2 seconds
+        }, 5000);
+    }
+
+    private async resumeSession(sessionId: string, previousSessionId: string) {
+        const ws = this.clients.get(sessionId);
+        if (!ws) return;
+
+        try {
+            const sessionExists = await this.sessionRepo.sessionExists(previousSessionId);
+            if (!sessionExists) {
+                throw new Error('Session not found');
+            }
+
+            await this.sessionRepo.linkSessions(previousSessionId, sessionId);
+            await this.sendSessionStatus(sessionId);
+        } catch (error) {
+            await this.handleError(ws, error);
+        }
     }
 
     private async handleError(ws: WebSocket, error: any) {
         const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
         const errorCode = error.code || 'UNKNOWN_ERROR';
         
-        // Log error for debugging
         console.error(`WebSocket error [${errorCode}]:`, error);
         
-        // Send structured error to client
         ws.send(JSON.stringify({
             type: 'ERROR',
             error: {
@@ -241,15 +266,8 @@ export class WebSocketService {
         return Math.random().toString(36).substr(2, 9);
     }
 
-    private sendError(ws: WebSocket, message: string) {
-        ws.send(JSON.stringify({
-            type: 'ERROR',
-            message
-        }));
-    }
-
-    private async startNewSession(sessionId: string) {
-        // Start a new session
-        await this.sessionRepo.startSession(sessionId);
+    private calculateAverageConfidence(history: any[]): number {
+        if (!history.length) return 0;
+        return history.reduce((acc, curr) => acc + curr.confidence, 0) / history.length;
     }
 }
