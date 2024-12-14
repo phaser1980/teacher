@@ -2,6 +2,7 @@ import { WebSocket } from 'ws';
 import { Pool } from 'pg';
 import { EventEmitter } from 'events';
 import { CardSeriesRepository } from '../repositories/card-series.repository';
+import { SessionRepository } from '../repositories/session.repository';
 import { analysisWorker } from '../workers/analysis.worker';
 
 interface AnalysisResult {
@@ -15,10 +16,12 @@ export class WebSocketService {
     private clients: Map<string, WebSocket> = new Map();
     private eventEmitter: EventEmitter;
     private cardSeriesRepo: CardSeriesRepository;
+    private sessionRepo: SessionRepository;
 
     constructor(pool: Pool) {
         this.eventEmitter = new EventEmitter();
         this.cardSeriesRepo = new CardSeriesRepository(pool);
+        this.sessionRepo = new SessionRepository(pool);
         this.setupEventListeners();
     }
 
@@ -72,13 +75,10 @@ export class WebSocketService {
         try {
             switch (data.type) {
                 case 'NEW_SYMBOL':
-                    await this.handleNewSymbol(sessionId, data);
-                    break;
-                case 'START_SESSION':
-                    await this.handleStartSession(sessionId);
+                    await this.handleNewSymbol(sessionId, data, ws);
                     break;
                 case 'END_SESSION':
-                    await this.handleEndSession(sessionId);
+                    await this.handleEndSession(sessionId, ws);
                     break;
                 default:
                     throw new Error(`Unknown message type: ${data.type}`);
@@ -92,11 +92,33 @@ export class WebSocketService {
         }
     }
 
-    private async handleNewSymbol(sessionId: string, data: any) {
+    private async handleNewSymbol(sessionId: string, data: any, ws: WebSocket) {
         const { symbol, position } = data;
+        
+        // Check if session exists and is active
+        let isActive = await this.sessionRepo.isSessionActive(sessionId);
+        
+        // If no active session, create one
+        if (!isActive) {
+            const newSessionId = await this.sessionRepo.createSession();
+            sessionId = newSessionId;
+            
+            // Notify client of new session
+            ws.send(JSON.stringify({
+                type: 'SESSION_STARTED',
+                sessionId: newSessionId
+            }));
+        }
         
         // Add symbol to database
         await this.cardSeriesRepo.addSymbol(sessionId, symbol, position);
+
+        // Notify client of successful symbol addition
+        ws.send(JSON.stringify({
+            type: 'SYMBOL_ADDED',
+            symbol,
+            position
+        }));
 
         // Check if we have enough symbols for analysis
         const symbolCount = await this.cardSeriesRepo.getSymbolCount(sessionId);
@@ -107,12 +129,22 @@ export class WebSocketService {
         }
     }
 
-    private async handleStartSession(sessionId: string) {
-        // Implementation moved to repository layer
-    }
-
-    private async handleEndSession(sessionId: string) {
-        // Implementation moved to repository layer
+    private async handleEndSession(sessionId: string, ws: WebSocket) {
+        const isActive = await this.sessionRepo.isSessionActive(sessionId);
+        
+        if (isActive) {
+            await this.sessionRepo.endSession(sessionId);
+            
+            ws.send(JSON.stringify({
+                type: 'SESSION_ENDED',
+                sessionId
+            }));
+        } else {
+            ws.send(JSON.stringify({
+                type: 'ERROR',
+                message: 'No active session found'
+            }));
+        }
     }
 
     private cleanup(sessionId: string) {
