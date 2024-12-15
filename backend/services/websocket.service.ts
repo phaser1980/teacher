@@ -2,16 +2,9 @@ import { WebSocket, Server } from 'ws';
 import { Pool } from 'pg';
 import Bull from 'bull';
 import { throttle } from 'lodash';
-import { SymbolRepository } from '../repositories/symbol.repository';
+import { CardSeriesRepository } from '../repositories/card-series.repository';
 import { SessionRepository } from '../repositories/session.repository';
 import { AnalysisRepository } from '../repositories/analysis.repository';
-
-interface AnalysisResult {
-    modelName: string;
-    prediction: number[];
-    confidence: number;
-    possibleRngSeed?: string;
-}
 
 interface SessionThresholds {
     basic: number;
@@ -27,7 +20,7 @@ interface WebSocketMessage {
 export class WebSocketService {
     private clients: Map<string, WebSocket> = new Map();
     private analysisQueue: Bull.Queue;
-    private symbolRepo: SymbolRepository;
+    private cardSeriesRepo: CardSeriesRepository;
     private sessionRepo: SessionRepository;
     private analysisRepo: AnalysisRepository;
     private readonly DEFAULT_THRESHOLDS: SessionThresholds = {
@@ -37,7 +30,7 @@ export class WebSocketService {
     };
 
     constructor(pool: Pool) {
-        this.symbolRepo = new SymbolRepository(pool);
+        this.cardSeriesRepo = new CardSeriesRepository(pool);
         this.sessionRepo = new SessionRepository(pool);
         this.analysisRepo = new AnalysisRepository(pool);
         this.analysisQueue = new Bull('analysis', {
@@ -111,11 +104,12 @@ export class WebSocketService {
         if (!ws) return;
 
         try {
-            // Store symbol
-            await this.symbolRepo.addSymbol(sessionId, symbol);
+            // Store symbol - validation happens in CardSeriesRepository
+            const position = await this.cardSeriesRepo.getSymbolCount(sessionId);
+            await this.cardSeriesRepo.addSymbol(sessionId, symbol, position + 1);
             
             // Get symbol count and thresholds
-            const count = await this.symbolRepo.getSymbolCount(sessionId);
+            const count = position + 1;
             const thresholds = await this.sessionRepo.getThresholds(sessionId) || this.DEFAULT_THRESHOLDS;
             
             // Send progress update
@@ -123,6 +117,7 @@ export class WebSocketService {
                 type: 'PROGRESS_UPDATE',
                 count,
                 thresholds,
+                lastSymbol: symbol,
                 milestones: {
                     basic: count >= thresholds.basic,
                     intermediate: count >= thresholds.intermediate,
@@ -168,7 +163,7 @@ export class WebSocketService {
     }
 
     private async triggerAnalysis(sessionId: string) {
-        const symbols = await this.symbolRepo.getSymbols(sessionId);
+        const symbols = await this.cardSeriesRepo.getSymbols(sessionId);
         
         // Add analysis job to queue with retries
         await this.analysisQueue.add({

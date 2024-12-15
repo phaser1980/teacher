@@ -1,65 +1,76 @@
-import React, { useState, useEffect } from 'react';
-import { useWebSocket } from '../hooks/useWebSocket';
+import React, { useState } from 'react';
+import { toast } from 'react-toastify';
+import { SymbolType, SymbolName, symbolMap, isValidSymbol } from '../utils/symbols';
 
 interface SymbolInputProps {
-    onSymbolSubmit: (symbol: number) => void;
+    onSymbolSubmit: (symbol: SymbolType) => void;
     disabled?: boolean;
 }
 
 export const SymbolInput: React.FC<SymbolInputProps> = ({ onSymbolSubmit, disabled }) => {
-    const [inputValue, setInputValue] = useState<string>('');
-    const [error, setError] = useState<string>('');
+    const [selectedSymbol, setSelectedSymbol] = useState<SymbolType | null>(null);
 
     const handleSubmit = (e: React.FormEvent) => {
         e.preventDefault();
-        const num = parseInt(inputValue);
-        
-        if (isNaN(num) || num < 1 || num > 52) {
-            setError('Please enter a valid card number (1-52)');
-            return;
+        if (selectedSymbol) {
+            onSymbolSubmit(selectedSymbol);
+            setSelectedSymbol(null);
         }
+    };
 
-        onSymbolSubmit(num);
-        setInputValue('');
-        setError('');
+    const handleSymbolSelect = (symbol: SymbolType) => {
+        setSelectedSymbol(symbol);
     };
 
     return (
         <div className="w-full max-w-md mx-auto p-4">
             <form onSubmit={handleSubmit} className="space-y-4">
                 <div>
-                    <label htmlFor="symbol" className="block text-sm font-medium text-gray-700">
-                        Enter Card Symbol (1-52)
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                        Select Card Symbol
                     </label>
-                    <div className="mt-1">
-                        <input
-                            type="number"
-                            id="symbol"
-                            min="1"
-                            max="52"
-                            value={inputValue}
-                            onChange={(e) => setInputValue(e.target.value)}
-                            disabled={disabled}
-                            className="shadow-sm focus:ring-indigo-500 focus:border-indigo-500 block w-full sm:text-sm border-gray-300 rounded-md"
-                            placeholder="Enter number 1-52"
-                        />
+                    <div className="grid grid-cols-2 gap-4">
+                        {(Object.entries(symbolMap) as [string, SymbolName][]).map(([value, name]) => (
+                            <button
+                                key={value}
+                                type="button"
+                                onClick={() => handleSymbolSelect(parseInt(value) as SymbolType)}
+                                disabled={disabled}
+                                className={`
+                                    p-4 rounded-lg border-2 transition-all duration-200
+                                    ${selectedSymbol === parseInt(value)
+                                        ? 'border-blue-500 bg-blue-50'
+                                        : 'border-gray-200 hover:border-blue-300'
+                                    }
+                                    ${disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}
+                                `}
+                            >
+                                <div className="text-center">
+                                    <div className="text-2xl mb-1">
+                                        {name === 'Hearts' && '♥️'}
+                                        {name === 'Diamonds' && '♦️'}
+                                        {name === 'Clubs' && '♣️'}
+                                        {name === 'Spades' && '♠️'}
+                                    </div>
+                                    <div className="text-sm font-medium text-gray-700">{name}</div>
+                                </div>
+                            </button>
+                        ))}
                     </div>
-                    {error && (
-                        <p className="mt-2 text-sm text-red-600">
-                            {error}
-                        </p>
-                    )}
                 </div>
                 <button
                     type="submit"
-                    disabled={disabled}
-                    className={`w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white 
-                        ${disabled 
-                            ? 'bg-gray-400 cursor-not-allowed' 
-                            : 'bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500'
-                        }`}
+                    disabled={disabled || !selectedSymbol}
+                    className={`
+                        w-full flex justify-center py-2 px-4 border border-transparent rounded-md 
+                        shadow-sm text-sm font-medium text-white transition-colors duration-200
+                        ${disabled || !selectedSymbol
+                            ? 'bg-gray-400 cursor-not-allowed'
+                            : 'bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500'
+                        }
+                    `}
                 >
-                    Submit
+                    Submit {selectedSymbol ? symbolMap[selectedSymbol] : ''}
                 </button>
             </form>
         </div>

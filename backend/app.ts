@@ -4,6 +4,7 @@ import { Server as WebSocketServer } from 'ws';
 import { Pool } from 'pg';
 import dotenv from 'dotenv';
 import { WebSocketService } from './services/websocket.service';
+import { createSymbolsRouter } from './routes/symbols';
 
 dotenv.config();
 
@@ -11,6 +12,10 @@ dotenv.config();
 const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
+
+// Middleware
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // Database connection
 const pool = new Pool({
@@ -23,6 +28,9 @@ const pool = new Pool({
 
 // Initialize WebSocket service
 const wsService = new WebSocketService(pool);
+
+// Routes
+app.use('/api', createSymbolsRouter(pool));
 
 // WebSocket connection handling
 wss.on('connection', (ws) => {

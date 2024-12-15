@@ -41,7 +41,7 @@ export default function Home() {
     };
 
     const { sendMessage, connectionStatus } = useWebSocket({
-        url: 'ws://localhost:3000',
+        url: 'ws://localhost:3001',
         onMessage: handleWebSocketMessage
     });
 
